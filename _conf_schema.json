@@ -1,0 +1,107 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "是否启用插件逻辑",
+    "default": true
+  },
+  "auto_poll": {
+    "type": "bool",
+    "description": "是否启用自动轮询自动回复",
+    "default": false,
+    "hint": "建议先手动执行 bili_run_once 验证，确认无误后再开启"
+  },
+  "poll_interval_seconds": {
+    "type": "int",
+    "description": "轮询间隔秒数",
+    "default": 120,
+    "hint": "建议一开始设置为 120 秒或更长，降低风控风险"
+  },
+  "provider_id": {
+    "type": "string",
+    "description": "用于后台生成回复的聊天模型 Provider ID",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "建议显式指定，而不是依赖当前会话模型"
+  },
+  "bilibili_uid": {
+    "type": "string",
+    "description": "B站 UP 主 UID",
+    "default": ""
+  },
+  "bilibili_cookie": {
+    "type": "text",
+    "description": "B站登录 Cookie",
+    "default": "",
+    "hint": "至少应包含 SESSDATA，回复时必须包含 bili_jct",
+    "obvious_hint": true
+  },
+  "bilibili_refresh_token": {
+    "type": "string",
+    "description": "B站 refresh_token（当前版本仍预留）",
+    "default": "",
+    "hint": "后续用于 Cookie 自动刷新"
+  },
+  "reply_only_when_mentioned": {
+    "type": "bool",
+    "description": "是否仅在评论 @我 时回复",
+    "default": true
+  },
+  "reply_prefix": {
+    "type": "string",
+    "description": "回复前缀",
+    "default": ""
+  },
+  "max_reply_chars": {
+    "type": "int",
+    "description": "回复最大字符数",
+    "default": 80
+  },
+  "max_comments_per_cycle": {
+    "type": "int",
+    "description": "每轮最多处理的评论数",
+    "default": 3
+  },
+  "reply_delay_seconds": {
+    "type": "float",
+    "description": "每次成功发送回复后的延迟秒数",
+    "default": 2.0
+  },
+  "video_cache_ttl_seconds": {
+    "type": "int",
+    "description": "视频列表缓存时间（秒）",
+    "default": 21600
+  },
+  "scan_video_limit": {
+    "type": "int",
+    "description": "扫描时最多检查多少个最新视频",
+    "default": 10
+  },
+  "scan_comment_page_size": {
+    "type": "int",
+    "description": "每个视频扫描多少条最新评论",
+    "default": 20
+  },
+  "scan_comment_page_limit": {
+    "type": "int",
+    "description": "每个视频最多扫描多少页评论",
+    "default": 2
+  },
+  "http_timeout_seconds": {
+    "type": "int",
+    "description": "HTTP 请求超时（秒）",
+    "default": 20
+  },
+  "dry_run": {
+    "type": "bool",
+    "description": "是否启用演练模式（开启时只生成不发送）",
+    "default": true,
+    "hint": "第一次联调建议保持 true，确认回复文本和命中范围正确后再关闭"
+  },
+  "persona_prompt": {
+    "type": "text",
+    "description": "回复人格提示词",
+    "default": "你是一个活跃在B站评论区、语气自然友好的UP主分身。请基于当前评论内容生成简短、自然、像真人说的话的回复。不要自称AI，不要机械客服腔，控制在80字以内。",
+    "editor_mode": true,
+    "editor_language": "markdown"
+  }
+}
