@@ -46,6 +46,18 @@ class BiliMessageTrigger:
             return str(self.ctime)
 
 
+
+
+@dataclass
+class BiliReplyTarget:
+    oid: str
+    reply_type: int
+    root_id: str
+    parent_id: str
+    business: str
+    source: str
+    matched_rpid: str = ""
+
 @dataclass
 class BiliCommentPreview:
     comment_id: str
@@ -283,6 +295,10 @@ JNrRuoEUXpabUzGB8QIDAQAB
         params = {"platform": "web", "build": 0, "mobi_app": "web", "web_location": 333.40164}
         return await self._request("GET", "https://api.bilibili.com/x/msgfeed/reply", params=params)
 
+    async def get_comment_replies(self, oid: str, reply_type: int, root_id: str, page: int = 1, page_size: int = 20) -> dict[str, Any]:
+        params = {"type": reply_type, "oid": oid, "root": root_id, "pn": page, "ps": page_size}
+        return await self._request("GET", "https://api.bilibili.com/x/v2/reply/reply", params=params)
+
     async def reply_to_comment(self, oid: str, reply_type: int, root_id: str, parent_id: str, message: str) -> dict[str, Any]:
         if not self.csrf_token:
             raise ValueError("Cookie 中缺少 bili_jct，无法发送回复")
@@ -297,7 +313,7 @@ JNrRuoEUXpabUzGB8QIDAQAB
         return await self._request("POST", "https://api.bilibili.com/x/v2/reply/add", data=data)
 
 
-@register("astrbot_plugin_bili_autoreply", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件", "0.6.2")
+@register("astrbot_plugin_bili_autoreply", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件", "0.6.4")
 class BilibiliReplyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -690,16 +706,125 @@ class BilibiliReplyPlugin(Star):
         }
         return meta, triggers
 
-    def _infer_reply_type(self, trigger: BiliMessageTrigger) -> int:
+    def _candidate_reply_types(self, trigger: BiliMessageTrigger) -> list[int]:
         business = (trigger.business or "").lower()
         title = (trigger.title or "").lower()
-        if business in {"dynamic", "dyn", "reply", "opus"}:
-            return 11
-        if "动态" in trigger.title or "置顶" in trigger.title:
-            return 11
         if business in {"archive", "video", "av"}:
-            return 1
-        return 1
+            return [1]
+        if business in {"dynamic", "dyn", "reply", "opus"} or "动态" in title or "置顶" in title:
+            return [11, 17, 1]
+        return [1, 11, 17]
+
+    def _extract_rpid(self, payload: dict[str, Any]) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("rpid_str", "rpid", "id_str", "id"):
+            value = payload.get(key)
+            if value is not None and str(value):
+                return str(value)
+        return ""
+
+    def _extract_parent_rpid(self, payload: dict[str, Any]) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("parent_str", "parent", "parent_rpid", "parent_rpid_str"):
+            value = payload.get(key)
+            if value is not None and str(value):
+                return str(value)
+        return ""
+
+    def _extract_message_text(self, payload: dict[str, Any]) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        content = payload.get("content") or {}
+        if isinstance(content, dict):
+            for key in ("message", "content"):
+                value = content.get(key)
+                if value:
+                    return str(value).strip()
+        for key in ("source_content", "message", "content"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _comment_matches_trigger(self, payload: dict[str, Any], trigger: BiliMessageTrigger) -> bool:
+        rpid = self._extract_rpid(payload)
+        parent_rpid = self._extract_parent_rpid(payload)
+        if rpid and rpid in {trigger.root_id, trigger.parent_id}:
+            return True
+        if parent_rpid and trigger.parent_id and parent_rpid == trigger.parent_id:
+            return True
+        message = self._extract_message_text(payload)
+        if message and trigger.source_content and message == trigger.source_content:
+            member = payload.get("member") or {}
+            mid = str(member.get("mid", "") or "")
+            uname = str(member.get("uname", "") or "")
+            if (trigger.user_mid and mid == trigger.user_mid) or (trigger.user_name and uname == trigger.user_name):
+                return True
+        return False
+
+    async def _enrich_reply_target(self, client: BilibiliApiClient, trigger: BiliMessageTrigger) -> list[BiliReplyTarget]:
+        targets: list[BiliReplyTarget] = []
+        seen: set[tuple[str, int, str, str]] = set()
+
+        def _append(oid: str, reply_type: int, root_id: str, parent_id: str, source: str, matched_rpid: str = ""):
+            key = (oid, reply_type, root_id, parent_id)
+            if not oid or not root_id or key in seen:
+                return
+            seen.add(key)
+            targets.append(BiliReplyTarget(
+                oid=oid,
+                reply_type=reply_type,
+                root_id=root_id,
+                parent_id=parent_id or root_id,
+                business=trigger.business,
+                source=source,
+                matched_rpid=matched_rpid,
+            ))
+
+        for reply_type in self._candidate_reply_types(trigger):
+            try:
+                detail = await client.get_comment_replies(trigger.oid, reply_type, trigger.root_id, page=1, page_size=20)
+            except Exception as e:  # noqa: BLE001
+                _append(trigger.oid, reply_type, trigger.root_id, trigger.parent_id or trigger.root_id, f"direct-fallback-error:{type(e).__name__}")
+                continue
+
+            if detail.get("code") != 0:
+                _append(trigger.oid, reply_type, trigger.root_id, trigger.parent_id or trigger.root_id, f"direct-fallback-code:{detail.get('code')}")
+                continue
+
+            data = (detail.get("data") or {}) if isinstance(detail, dict) else {}
+            root_item = data.get("root") if isinstance(data, dict) else None
+            normalized_root = self._extract_rpid(root_item) if isinstance(root_item, dict) else ""
+            normalized_root = normalized_root or trigger.root_id
+            if isinstance(root_item, dict) and self._comment_matches_trigger(root_item, trigger):
+                _append(trigger.oid, reply_type, normalized_root, normalized_root, "detail-root", matched_rpid=normalized_root)
+                continue
+
+            replies = data.get("replies", []) if isinstance(data, dict) else []
+            matched = False
+            if isinstance(replies, list):
+                for reply in replies:
+                    if not isinstance(reply, dict):
+                        continue
+                    if not self._comment_matches_trigger(reply, trigger):
+                        continue
+                    matched_rpid = self._extract_rpid(reply) or trigger.parent_id or normalized_root
+                    parent_rpid = self._extract_parent_rpid(reply) or normalized_root
+                    if matched_rpid == normalized_root:
+                        parent_for_send = normalized_root
+                    else:
+                        parent_for_send = matched_rpid
+                    _append(trigger.oid, reply_type, normalized_root, parent_for_send, "detail-replies", matched_rpid=matched_rpid)
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            _append(trigger.oid, reply_type, normalized_root, trigger.parent_id or normalized_root, "detail-fallback")
+
+        return targets
 
     async def _generate_reply_for_trigger(self, trigger: BiliMessageTrigger) -> str:
         provider_id = self._provider_id_from_config()
@@ -818,24 +943,37 @@ class BilibiliReplyPlugin(Star):
                     processed_now.append(history)
                     continue
 
-                reply_type = self._infer_reply_type(trigger)
-                history["reply_type"] = reply_type
-                result = await client.reply_to_comment(
-                    oid=trigger.oid,
-                    reply_type=reply_type,
-                    root_id=trigger.root_id,
-                    parent_id=trigger.parent_id or trigger.root_id,
-                    message=reply_text,
-                )
-                history["api_result"] = result
-                if result.get("code") == 0:
-                    history["status"] = "replied"
-                    self._mark_processed_message(trigger.msg_id)
-                    if trigger.parent_id:
-                        self._mark_processed_comment(trigger.parent_id)
-                    self._save_processed_comments()
+                reply_targets = await self._enrich_reply_target(client, trigger)
+                history["reply_targets"] = [asdict(item) for item in reply_targets]
+                last_result: dict[str, Any] = {}
+                for target in reply_targets:
+                    result = await client.reply_to_comment(
+                        oid=target.oid,
+                        reply_type=target.reply_type,
+                        root_id=target.root_id,
+                        parent_id=target.parent_id or target.root_id,
+                        message=reply_text,
+                    )
+                    attempt = asdict(target)
+                    attempt["api_result"] = result
+                    history.setdefault("attempts", []).append(attempt)
+                    last_result = result
+                    if result.get("code") == 0:
+                        history["status"] = "replied"
+                        history["reply_type"] = target.reply_type
+                        history["reply_target"] = asdict(target)
+                        history["api_result"] = result
+                        self._mark_processed_message(trigger.msg_id)
+                        if trigger.parent_id:
+                            self._mark_processed_comment(trigger.parent_id)
+                        self._save_processed_comments()
+                        break
                 else:
                     history["status"] = "failed"
+                    if reply_targets:
+                        history["reply_type"] = reply_targets[0].reply_type
+                        history["reply_target"] = asdict(reply_targets[0])
+                    history["api_result"] = last_result
                 self._append_history(history)
                 processed_now.append(history)
                 await asyncio.sleep(self._reply_delay_seconds())
@@ -867,11 +1005,13 @@ class BilibiliReplyPlugin(Star):
             try:
                 if self._enabled() and self._auto_poll_enabled():
                     result = await self._process_one_cycle()
+                    statuses = [item.get("status", "unknown") for item in result.get("processed", [])]
                     logger.info(
-                        "bili auto cycle done: candidates=%s processed=%s dry_run=%s",
+                        "bili auto cycle done: candidates=%s processed=%s dry_run=%s statuses=%s",
                         result["candidates"],
                         len(result["processed"]),
                         result["dry_run"],
+                        statuses,
                     )
             except asyncio.CancelledError:
                 raise
@@ -1131,7 +1271,7 @@ class BilibiliReplyPlugin(Star):
             lines.append("")
             for item in triggers[:10]:
                 lines.append(
-                    f"- [{item.msg_kind}] {item.user_name} | msg_id={item.msg_id} | oid={item.oid} | root={item.root_id} | parent={item.parent_id}\n"
+                    f"- [{item.msg_kind}] {item.user_name} | msg_id={item.msg_id} | oid={item.oid} | root={item.root_id} | parent={item.parent_id} | business={item.business}\n"
                     f"  title={item.title[:30]}\n"
                     f"  content={item.source_content[:120]}"
                 )
@@ -1155,9 +1295,16 @@ class BilibiliReplyPlugin(Star):
         ]
         for item in result["processed"][:5]:
             trigger = item.get("trigger", {})
+            api_result = item.get("api_result") or {}
+            extra = ""
+            if item.get("status") == "failed":
+                extra = (
+                    f"\n  api_code={api_result.get('code')} api_message={api_result.get('message')}"
+                    f"\n  reply_target={item.get('reply_target')}"
+                )
             lines.append(
                 f"- {item.get('status')} | {trigger.get('user_name')} | msg_id={trigger.get('msg_id')} | oid={trigger.get('oid')}\n"
-                f"  reply={item.get('reply_text', '')[:160]}"
+                f"  reply={item.get('reply_text', '')[:160]}{extra}"
             )
         if result.get("baseline_initialized"):
             lines.append("- 已初始化消息基线；旧消息不会被回复。请在产生新 @/回复 后再次执行。")
