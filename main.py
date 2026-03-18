@@ -99,6 +99,8 @@ JNrRuoEUXpabUzGB8QIDAQAB
         self.refresh_token = refresh_token.strip()
         self._nav_cache: dict[str, Any] | None = None
         self._wbi_keys_cache: tuple[str, str] | None = None
+        self._client: httpx.AsyncClient | None = None
+        self._client_cookie_snapshot: tuple[tuple[str, str], ...] = ()
 
     @staticmethod
     def _parse_cookie(cookie_str: str) -> dict[str, str]:
@@ -146,12 +148,43 @@ JNrRuoEUXpabUzGB8QIDAQAB
             "Origin": "https://www.bilibili.com",
         }
 
+    def _cookie_snapshot(self) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted(self._parse_cookie(self.cookie).items()))
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        cookie_snapshot = self._cookie_snapshot()
+        if (
+            self._client is None
+            or self._client.is_closed
+            or cookie_snapshot != self._client_cookie_snapshot
+        ):
+            if self._client is not None and not self._client.is_closed:
+                await self._client.aclose()
+            self._client = httpx.AsyncClient(
+                timeout=self.timeout,
+                headers=self._headers(),
+                cookies=dict(cookie_snapshot),
+            )
+            self._client_cookie_snapshot = cookie_snapshot
+        return self._client
+
+    async def aclose(self):
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
+        self._client_cookie_snapshot = ()
+
+    async def __aenter__(self) -> BilibiliApiClient:
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.aclose()
+
     async def _request(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
-        cookies = self._parse_cookie(self.cookie)
-        async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers(), cookies=cookies) as client:
-            response = await client.request(method, url, **kwargs)
-            response.raise_for_status()
-            return response.json()
+        client = await self._get_client()
+        response = await client.request(method, url, **kwargs)
+        response.raise_for_status()
+        return response.json()
 
     async def get_login_info(self) -> dict[str, Any]:
         if self._nav_cache is None:
@@ -166,11 +199,10 @@ JNrRuoEUXpabUzGB8QIDAQAB
         ts = timestamp_ms or int(time.time() * 1000)
         correspond_path = self._generate_correspond_path(ts)
         url = f"https://www.bilibili.com/correspond/1/{quote(correspond_path, safe='')}"
-        cookies = self._parse_cookie(self.cookie)
-        async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers(), cookies=cookies) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            html = response.text
+        client = await self._get_client()
+        response = await client.get(url)
+        response.raise_for_status()
+        html = response.text
         match = re.search(r'<div id="1-name">([^<]+)</div>', html)
         if not match:
             raise ValueError("未能从 correspond 页面提取 refresh_csrf")
@@ -184,21 +216,20 @@ JNrRuoEUXpabUzGB8QIDAQAB
         timestamp_ms = int(data_info.get("timestamp", 0) or int(time.time() * 1000))
         refresh_csrf = await self.get_refresh_csrf(timestamp_ms)
         old_refresh_token = self.refresh_token
-        cookies = self._parse_cookie(self.cookie)
         payload = {
             "csrf": self.csrf_token,
             "refresh_csrf": refresh_csrf,
             "source": "main_web",
             "refresh_token": self.refresh_token,
         }
-        async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers(), cookies=cookies) as client:
-            response = await client.post(
-                "https://passport.bilibili.com/x/passport-login/web/cookie/refresh",
-                data=payload,
-            )
-            response.raise_for_status()
-            result = response.json()
-            response_cookies = {k: v for k, v in response.cookies.items()}
+        client = await self._get_client()
+        response = await client.post(
+            "https://passport.bilibili.com/x/passport-login/web/cookie/refresh",
+            data=payload,
+        )
+        response.raise_for_status()
+        result = response.json()
+        response_cookies = {k: v for k, v in response.cookies.items()}
         if result.get("code") != 0:
             return {"ok": False, "stage": "refresh", "result": result}
         if response_cookies:
@@ -510,13 +541,35 @@ class BilibiliReplyPlugin(Star):
         return int(self.config.get("scan_comment_page_limit", 2) or 2)
 
     def _poll_interval_seconds(self) -> int:
-        return int(self.config.get("poll_interval_seconds", 120) or 120)
+        return max(1, int(self.config.get("poll_interval_seconds", 120) or 120))
 
     def _max_comments_per_cycle(self) -> int:
         return int(self.config.get("max_comments_per_cycle", 5) or 5)
 
     def _reply_delay_seconds(self) -> float:
-        return float(self.config.get("reply_delay_seconds", 2) or 2)
+        return max(0.0, float(self.config.get("reply_delay_seconds", 2) or 2))
+
+    def _dry_run_marks_processed(self) -> bool:
+        return bool(self.config.get("dry_run_mark_processed", False))
+
+    @staticmethod
+    def _msg_id_gt(left: str, right: str) -> bool:
+        if not right:
+            return bool(left)
+        try:
+            return int(left) > int(right)
+        except (TypeError, ValueError):
+            return str(left) > str(right)
+
+    @staticmethod
+    def _finalize_reply_text(raw_text: str, *, max_chars: int, reply_prefix: str = "") -> str:
+        text = (raw_text or "").strip()
+        if len(text) > max_chars:
+            text = text[:max_chars]
+        final_text = f"{reply_prefix}{text}".strip()
+        if not final_text:
+            raise ValueError("LLM 返回空回复，已跳过发送")
+        return final_text
 
     @staticmethod
     def _is_mention(message: str, uname: str) -> bool:
@@ -559,66 +612,66 @@ class BilibiliReplyPlugin(Star):
 
     async def _scan_recent_mentions(self) -> tuple[dict[str, Any], list[BiliCommentPreview]]:
         uid = self._configured_uid()
-        client = self._build_client()
-        if not client.is_configured():
-            raise ValueError("未配置 bilibili_cookie")
-        if not uid:
-            raise ValueError("未配置 bilibili_uid")
+        async with self._build_client() as client:
+            if not client.is_configured():
+                raise ValueError("未配置 bilibili_cookie")
+            if not uid:
+                raise ValueError("未配置 bilibili_uid")
 
-        nav = await client.get_login_info()
-        nav_data = (nav.get("data") or {}) if isinstance(nav, dict) else {}
-        self_mid = str(nav_data.get("mid", "") or "")
-        self_uname = str(nav_data.get("uname", "") or "").strip()
+            nav = await client.get_login_info()
+            nav_data = (nav.get("data") or {}) if isinstance(nav, dict) else {}
+            self_mid = str(nav_data.get("mid", "") or "")
+            self_uname = str(nav_data.get("uname", "") or "").strip()
 
-        target_video_limit = self._scan_video_limit()
-        page_size = min(target_video_limit, 20) if target_video_limit > 0 else 10
-        video_pages = max(1, math.ceil(target_video_limit / page_size))
+            target_video_limit = self._scan_video_limit()
+            page_size = min(target_video_limit, 20) if target_video_limit > 0 else 10
+            video_pages = max(1, math.ceil(target_video_limit / page_size))
 
-        vlist: list[dict[str, Any]] = []
-        for page in range(1, video_pages + 1):
-            videos = await client.get_video_list(uid=uid, page=page, page_size=page_size)
-            page_vlist = videos.get("data", {}).get("list", {}).get("vlist", []) if isinstance(videos, dict) else []
-            if not page_vlist:
-                break
-            for video in page_vlist:
-                if isinstance(video, dict):
-                    vlist.append(video)
-                    if len(vlist) >= target_video_limit:
+            vlist: list[dict[str, Any]] = []
+            for page in range(1, video_pages + 1):
+                videos = await client.get_video_list(uid=uid, page=page, page_size=page_size)
+                page_vlist = videos.get("data", {}).get("list", {}).get("vlist", []) if isinstance(videos, dict) else []
+                if not page_vlist:
+                    break
+                for video in page_vlist:
+                    if isinstance(video, dict):
+                        vlist.append(video)
+                        if len(vlist) >= target_video_limit:
+                            break
+                if len(vlist) >= target_video_limit:
+                    break
+
+            previews: list[BiliCommentPreview] = []
+            video_debug: list[dict[str, Any]] = []
+            for video in vlist:
+                aid = str(video.get("aid", "") or "")
+                bvid = str(video.get("bvid", "") or "")
+                title = str(video.get("title", "") or "")
+                if not aid:
+                    continue
+                per_video_count = 0
+                for page in range(1, self._scan_comment_page_limit() + 1):
+                    comments = await client.get_video_comments(aid=aid, page=page, page_size=self._scan_comment_page_size())
+                    replies = comments.get("data", {}).get("replies", []) if isinstance(comments, dict) else []
+                    if not replies:
                         break
-            if len(vlist) >= target_video_limit:
-                break
-
-        previews: list[BiliCommentPreview] = []
-        video_debug: list[dict[str, Any]] = []
-        for video in vlist:
-            aid = str(video.get("aid", "") or "")
-            bvid = str(video.get("bvid", "") or "")
-            title = str(video.get("title", "") or "")
-            if not aid:
-                continue
-            per_video_count = 0
-            for page in range(1, self._scan_comment_page_limit() + 1):
-                comments = await client.get_video_comments(aid=aid, page=page, page_size=self._scan_comment_page_size())
-                replies = comments.get("data", {}).get("replies", []) if isinstance(comments, dict) else []
-                if not replies:
-                    break
-                for reply in replies or []:
-                    if not isinstance(reply, dict):
-                        continue
-                    preview = self._build_comment_preview(reply=reply, aid=aid, bvid=bvid, title=title, self_mid=self_mid, self_uname=self_uname)
-                    if preview:
-                        previews.append(preview)
-                        per_video_count += 1
-                    for sub_reply in (reply.get("replies", []) or []):
-                        if not isinstance(sub_reply, dict):
+                    for reply in replies or []:
+                        if not isinstance(reply, dict):
                             continue
-                        sub_preview = self._build_comment_preview(reply=sub_reply, aid=aid, bvid=bvid, title=title, self_mid=self_mid, self_uname=self_uname)
-                        if sub_preview:
-                            previews.append(sub_preview)
+                        preview = self._build_comment_preview(reply=reply, aid=aid, bvid=bvid, title=title, self_mid=self_mid, self_uname=self_uname)
+                        if preview:
+                            previews.append(preview)
                             per_video_count += 1
-                if len(replies) < self._scan_comment_page_size():
-                    break
-            video_debug.append({"title": title, "bvid": bvid, "aid": aid, "comment_count": per_video_count})
+                        for sub_reply in (reply.get("replies", []) or []):
+                            if not isinstance(sub_reply, dict):
+                                continue
+                            sub_preview = self._build_comment_preview(reply=sub_reply, aid=aid, bvid=bvid, title=title, self_mid=self_mid, self_uname=self_uname)
+                            if sub_preview:
+                                previews.append(sub_preview)
+                                per_video_count += 1
+                    if len(replies) < self._scan_comment_page_size():
+                        break
+                video_debug.append({"title": title, "bvid": bvid, "aid": aid, "comment_count": per_video_count})
 
         meta = {
             "self_mid": self_mid,
@@ -631,15 +684,17 @@ class BilibiliReplyPlugin(Star):
         return meta, previews
 
     async def _fetch_message_debug_payload(self) -> dict[str, Any]:
-        client = self._build_client()
-        unread = await client.get_msg_feed_unread()
-        at_data = await client.get_msg_feed_at()
-        reply_data = await client.get_msg_feed_reply()
-        return {
-            "unread": unread,
-            "at": at_data,
-            "reply": reply_data,
-        }
+        async with self._build_client() as client:
+            unread, at_data, reply_data = await asyncio.gather(
+                client.get_msg_feed_unread(),
+                client.get_msg_feed_at(),
+                client.get_msg_feed_reply(),
+            )
+            return {
+                "unread": unread,
+                "at": at_data,
+                "reply": reply_data,
+            }
 
     async def _scan_message_triggers(self) -> tuple[dict[str, Any], list[BiliMessageTrigger]]:
         client = self._build_client()
@@ -845,10 +900,11 @@ class BilibiliReplyPlugin(Star):
             ),
             system_prompt=system_prompt,
         )
-        text = (llm_resp.completion_text or "").strip()
-        if len(text) > max_chars:
-            text = text[:max_chars]
-        return f"{reply_prefix}{text}".strip()
+        return self._finalize_reply_text(
+            llm_resp.completion_text or "",
+            max_chars=max_chars,
+            reply_prefix=reply_prefix,
+        )
 
     async def _generate_reply_text(self, comment: BiliCommentPreview) -> str:
         provider_id = self._provider_id_from_config()
@@ -868,10 +924,11 @@ class BilibiliReplyPlugin(Star):
             ),
             system_prompt=system_prompt,
         )
-        text = (llm_resp.completion_text or "").strip()
-        if len(text) > max_chars:
-            text = text[:max_chars]
-        return f"{reply_prefix}{text}".strip()
+        return self._finalize_reply_text(
+            llm_resp.completion_text or "",
+            max_chars=max_chars,
+            reply_prefix=reply_prefix,
+        )
 
     def _dedupe_triggers(self, triggers: list[BiliMessageTrigger]) -> list[BiliMessageTrigger]:
         deduped: list[BiliMessageTrigger] = []
@@ -891,7 +948,7 @@ class BilibiliReplyPlugin(Star):
         baseline_id = str(self.message_baseline.get("msg_id", "") or "")
         if trigger.ctime > baseline_time:
             return True
-        if trigger.ctime == baseline_time and baseline_id and trigger.msg_id > baseline_id:
+        if trigger.ctime == baseline_time and baseline_id and self._msg_id_gt(trigger.msg_id, baseline_id):
             return True
         return False
 
@@ -918,7 +975,6 @@ class BilibiliReplyPlugin(Star):
             max_count = self._max_comments_per_cycle()
             dry_run = bool(self.config.get("dry_run", True))
             processed_now: list[dict[str, Any]] = []
-            client = self._build_client()
 
             if baseline_initialized:
                 return {
@@ -929,54 +985,64 @@ class BilibiliReplyPlugin(Star):
                     "baseline_initialized": True,
                 }
 
-            for trigger in candidates[:max_count]:
-                reply_text = await self._generate_reply_for_trigger(trigger)
-                history = {
-                    "time": datetime.now().isoformat(),
-                    "dry_run": dry_run,
-                    "trigger": asdict(trigger),
-                    "reply_text": reply_text,
-                }
-                if dry_run:
-                    history["status"] = "dry_run"
+            async with self._build_client() as client:
+                for trigger in candidates[:max_count]:
+                    history = {
+                        "time": datetime.now().isoformat(),
+                        "dry_run": dry_run,
+                        "trigger": asdict(trigger),
+                    }
+                    try:
+                        reply_text = await self._generate_reply_for_trigger(trigger)
+                        history["reply_text"] = reply_text
+
+                        if dry_run:
+                            history["status"] = "dry_run"
+                            if self._dry_run_marks_processed():
+                                self._mark_processed_message(trigger.msg_id)
+                                history["dry_run_mark_processed"] = True
+                                self._save_processed_comments()
+                            self._append_history(history)
+                            processed_now.append(history)
+                            continue
+
+                        reply_targets = await self._enrich_reply_target(client, trigger)
+                        history["reply_targets"] = [asdict(item) for item in reply_targets]
+                        last_result: dict[str, Any] = {}
+                        for target in reply_targets:
+                            result = await client.reply_to_comment(
+                                oid=target.oid,
+                                reply_type=target.reply_type,
+                                root_id=target.root_id,
+                                parent_id=target.parent_id or target.root_id,
+                                message=reply_text,
+                            )
+                            attempt = asdict(target)
+                            attempt["api_result"] = result
+                            history.setdefault("attempts", []).append(attempt)
+                            last_result = result
+                            if result.get("code") == 0:
+                                history["status"] = "replied"
+                                history["reply_type"] = target.reply_type
+                                history["reply_target"] = asdict(target)
+                                history["api_result"] = result
+                                self._mark_processed_message(trigger.msg_id)
+                                if trigger.parent_id:
+                                    self._mark_processed_comment(trigger.parent_id)
+                                self._save_processed_comments()
+                                break
+                        else:
+                            history["status"] = "failed"
+                            if reply_targets:
+                                history["reply_type"] = reply_targets[0].reply_type
+                                history["reply_target"] = asdict(reply_targets[0])
+                            history["api_result"] = last_result
+                    except Exception as e:  # noqa: BLE001
+                        history["status"] = "failed"
+                        history["error"] = str(e)
                     self._append_history(history)
                     processed_now.append(history)
-                    continue
-
-                reply_targets = await self._enrich_reply_target(client, trigger)
-                history["reply_targets"] = [asdict(item) for item in reply_targets]
-                last_result: dict[str, Any] = {}
-                for target in reply_targets:
-                    result = await client.reply_to_comment(
-                        oid=target.oid,
-                        reply_type=target.reply_type,
-                        root_id=target.root_id,
-                        parent_id=target.parent_id or target.root_id,
-                        message=reply_text,
-                    )
-                    attempt = asdict(target)
-                    attempt["api_result"] = result
-                    history.setdefault("attempts", []).append(attempt)
-                    last_result = result
-                    if result.get("code") == 0:
-                        history["status"] = "replied"
-                        history["reply_type"] = target.reply_type
-                        history["reply_target"] = asdict(target)
-                        history["api_result"] = result
-                        self._mark_processed_message(trigger.msg_id)
-                        if trigger.parent_id:
-                            self._mark_processed_comment(trigger.parent_id)
-                        self._save_processed_comments()
-                        break
-                else:
-                    history["status"] = "failed"
-                    if reply_targets:
-                        history["reply_type"] = reply_targets[0].reply_type
-                        history["reply_target"] = asdict(reply_targets[0])
-                    history["api_result"] = last_result
-                self._append_history(history)
-                processed_now.append(history)
-                await asyncio.sleep(self._reply_delay_seconds())
+                    await asyncio.sleep(self._reply_delay_seconds())
 
             return {
                 "meta": meta,
@@ -1026,12 +1092,14 @@ class BilibiliReplyPlugin(Star):
         auto_poll = self._auto_poll_enabled()
         dry_run = bool(self.config.get("dry_run", True))
         only_at = bool(self.config.get("reply_only_when_mentioned", True))
+        dry_run_mark_processed = self._dry_run_marks_processed()
         return (
             "B站回复插件状态\n"
             f"- enabled: {self._enabled()}\n"
             f"- auto_poll: {auto_poll}\n"
             f"- auto_task_running: {bool(self._auto_task and not self._auto_task.done())}\n"
             f"- dry_run: {dry_run}\n"
+            f"- dry_run_mark_processed: {dry_run_mark_processed}\n"
             f"- only_reply_when_mentioned: {only_at}\n"
             f"- bilibili_uid_configured: {bool(uid)}\n"
             f"- bilibili_cookie_configured: {bool(cookie)}\n"
@@ -1054,107 +1122,107 @@ class BilibiliReplyPlugin(Star):
     @filter.command("bili_cookie_status")
     async def bili_cookie_status(self, event: AstrMessageEvent):
         """查看 Cookie 是否需要刷新。"""
-        client = self._build_client()
-        if not client.is_configured():
-            yield event.plain_result("未配置 bilibili_cookie。")
-            return
-        try:
-            info = await client.get_cookie_refresh_info()
-            data = (info.get("data") or {}) if isinstance(info, dict) else {}
-            yield event.plain_result(
-                "Cookie 刷新状态\n"
-                f"- code: {info.get('code')}\n"
-                f"- message: {info.get('message')}\n"
-                f"- need_refresh: {data.get('refresh')}\n"
-                f"- timestamp: {data.get('timestamp')}\n"
-                f"- refresh_token_configured: {client.has_refresh_token()}"
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.exception("查询 Cookie 刷新状态失败")
-            yield event.plain_result(f"查询失败：{e}")
+        async with self._build_client() as client:
+            if not client.is_configured():
+                yield event.plain_result("未配置 bilibili_cookie。")
+                return
+            try:
+                info = await client.get_cookie_refresh_info()
+                data = (info.get("data") or {}) if isinstance(info, dict) else {}
+                yield event.plain_result(
+                    "Cookie 刷新状态\n"
+                    f"- code: {info.get('code')}\n"
+                    f"- message: {info.get('message')}\n"
+                    f"- need_refresh: {data.get('refresh')}\n"
+                    f"- timestamp: {data.get('timestamp')}\n"
+                    f"- refresh_token_configured: {client.has_refresh_token()}"
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.exception("查询 Cookie 刷新状态失败")
+                yield event.plain_result(f"查询失败：{e}")
 
     @filter.command("bili_refresh_cookie")
     async def bili_refresh_cookie(self, event: AstrMessageEvent):
         """手动刷新 Cookie，并写回插件配置。"""
-        client = self._build_client()
-        if not client.is_configured():
-            yield event.plain_result("未配置 bilibili_cookie。")
-            return
-        if not client.has_refresh_token():
-            yield event.plain_result("未配置 bilibili_refresh_token，无法刷新。")
-            return
-        try:
-            result = await client.refresh_cookie()
-            if result.get("ok"):
-                self._update_runtime_auth(
-                    cookie=result.get("new_cookie"),
-                    refresh_token=result.get("new_refresh_token"),
-                )
-                yield event.plain_result(
-                    "Cookie 刷新成功\n"
-                    f"- refresh.code: {((result.get('refresh_result') or {}).get('code'))}\n"
-                    f"- confirm.code: {((result.get('confirm_result') or {}).get('code'))}\n"
-                    f"- refresh_token_updated: {bool(result.get('new_refresh_token'))}"
-                )
-            else:
-                refresh_result = result.get("result") or result.get("refresh_result") or {}
-                yield event.plain_result(
-                    "Cookie 刷新失败\n"
-                    f"- stage: {result.get('stage')}\n"
-                    f"- code: {refresh_result.get('code')}\n"
-                    f"- message: {refresh_result.get('message')}"
-                )
-        except Exception as e:  # noqa: BLE001
-            logger.exception("刷新 Cookie 失败")
-            yield event.plain_result(f"刷新失败：{e}")
+        async with self._build_client() as client:
+            if not client.is_configured():
+                yield event.plain_result("未配置 bilibili_cookie。")
+                return
+            if not client.has_refresh_token():
+                yield event.plain_result("未配置 bilibili_refresh_token，无法刷新。")
+                return
+            try:
+                result = await client.refresh_cookie()
+                if result.get("ok"):
+                    self._update_runtime_auth(
+                        cookie=result.get("new_cookie"),
+                        refresh_token=result.get("new_refresh_token"),
+                    )
+                    yield event.plain_result(
+                        "Cookie 刷新成功\n"
+                        f"- refresh.code: {((result.get('refresh_result') or {}).get('code'))}\n"
+                        f"- confirm.code: {((result.get('confirm_result') or {}).get('code'))}\n"
+                        f"- refresh_token_updated: {bool(result.get('new_refresh_token'))}"
+                    )
+                else:
+                    refresh_result = result.get("result") or result.get("refresh_result") or {}
+                    yield event.plain_result(
+                        "Cookie 刷新失败\n"
+                        f"- stage: {result.get('stage')}\n"
+                        f"- code: {refresh_result.get('code')}\n"
+                        f"- message: {refresh_result.get('message')}"
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.exception("刷新 Cookie 失败")
+                yield event.plain_result(f"刷新失败：{e}")
 
     @filter.command("bili_probe")
     async def bili_probe(self, event: AstrMessageEvent):
         """使用 B 站只读接口探测 Cookie / UID 是否可用。"""
         uid = self._configured_uid()
-        client = self._build_client()
-        if not client.is_configured():
-            yield event.plain_result("未配置 bilibili_cookie，无法探测。")
-            return
-        if not uid:
-            yield event.plain_result("未配置 bilibili_uid，无法探测视频列表。")
-            return
-        try:
-            nav = await client.get_login_info()
-            nav_code = nav.get("code")
-            nav_data = (nav.get("data") or {}) if isinstance(nav, dict) else {}
-            uname = nav_data.get("uname", "未知")
-            mid = nav_data.get("mid", "未知")
-            is_login = nav_data.get("isLogin", False)
-            wbi_img = nav_data.get("wbi_img", {}) if isinstance(nav_data, dict) else {}
-            has_wbi = bool(wbi_img.get("img_url")) and bool(wbi_img.get("sub_url"))
-            videos = await client.get_video_list(uid=uid, page=1, page_size=5)
-            videos_code = videos.get("code")
-            videos_message = videos.get("message", "") if isinstance(videos, dict) else ""
-            vlist = videos.get("data", {}).get("list", {}).get("vlist", []) if isinstance(videos, dict) else []
-            sample_titles = [item.get("title", "") for item in vlist[:3] if isinstance(item, dict)]
-            lines = [
-                "B站探针结果",
-                f"- nav.code: {nav_code}",
-                f"- is_login: {is_login}",
-                f"- uname: {uname}",
-                f"- mid: {mid}",
-                f"- csrf_present: {bool(client.csrf_token)}",
-                f"- has_wbi_keys: {has_wbi}",
-                f"- video_api.code: {videos_code}",
-                f"- video_api.message: {videos_message}",
-                f"- sample_video_count: {len(vlist)}",
-            ]
-            if sample_titles:
-                lines.append("- sample_titles:")
-                lines.extend([f"  - {title}" for title in sample_titles])
-            yield event.plain_result("\n".join(lines))
-        except httpx.HTTPStatusError as e:
-            logger.exception("B站探针 HTTP 错误")
-            yield event.plain_result(f"B站探针失败：HTTP {e.response.status_code}")
-        except Exception as e:  # noqa: BLE001
-            logger.exception("B站探针异常")
-            yield event.plain_result(f"B站探针失败：{e}")
+        async with self._build_client() as client:
+            if not client.is_configured():
+                yield event.plain_result("未配置 bilibili_cookie，无法探测。")
+                return
+            if not uid:
+                yield event.plain_result("未配置 bilibili_uid，无法探测视频列表。")
+                return
+            try:
+                nav = await client.get_login_info()
+                nav_code = nav.get("code")
+                nav_data = (nav.get("data") or {}) if isinstance(nav, dict) else {}
+                uname = nav_data.get("uname", "未知")
+                mid = nav_data.get("mid", "未知")
+                is_login = nav_data.get("isLogin", False)
+                wbi_img = nav_data.get("wbi_img", {}) if isinstance(nav_data, dict) else {}
+                has_wbi = bool(wbi_img.get("img_url")) and bool(wbi_img.get("sub_url"))
+                videos = await client.get_video_list(uid=uid, page=1, page_size=5)
+                videos_code = videos.get("code")
+                videos_message = videos.get("message", "") if isinstance(videos, dict) else ""
+                vlist = videos.get("data", {}).get("list", {}).get("vlist", []) if isinstance(videos, dict) else []
+                sample_titles = [item.get("title", "") for item in vlist[:3] if isinstance(item, dict)]
+                lines = [
+                    "B站探针结果",
+                    f"- nav.code: {nav_code}",
+                    f"- is_login: {is_login}",
+                    f"- uname: {uname}",
+                    f"- mid: {mid}",
+                    f"- csrf_present: {bool(client.csrf_token)}",
+                    f"- has_wbi_keys: {has_wbi}",
+                    f"- video_api.code: {videos_code}",
+                    f"- video_api.message: {videos_message}",
+                    f"- sample_video_count: {len(vlist)}",
+                ]
+                if sample_titles:
+                    lines.append("- sample_titles:")
+                    lines.extend([f"  - {title}" for title in sample_titles])
+                yield event.plain_result("\n".join(lines))
+            except httpx.HTTPStatusError as e:
+                logger.exception("B站探针 HTTP 错误")
+                yield event.plain_result(f"B站探针失败：HTTP {e.response.status_code}")
+            except Exception as e:  # noqa: BLE001
+                logger.exception("B站探针异常")
+                yield event.plain_result(f"B站探针失败：{e}")
 
     @filter.command("bili_scan")
     async def bili_scan(self, event: AstrMessageEvent):
@@ -1298,10 +1366,13 @@ class BilibiliReplyPlugin(Star):
             api_result = item.get("api_result") or {}
             extra = ""
             if item.get("status") == "failed":
+                error_text = item.get("error")
                 extra = (
                     f"\n  api_code={api_result.get('code')} api_message={api_result.get('message')}"
                     f"\n  reply_target={item.get('reply_target')}"
                 )
+                if error_text:
+                    extra += f"\n  error={error_text}"
             lines.append(
                 f"- {item.get('status')} | {trigger.get('user_name')} | msg_id={trigger.get('msg_id')} | oid={trigger.get('oid')}\n"
                 f"  reply={item.get('reply_text', '')[:160]}{extra}"
@@ -1333,10 +1404,12 @@ class BilibiliReplyPlugin(Star):
                 prompt=("请把下面这条B站评论回复成自然、简短、像真人会说的话。" f"要求：不超过{max_chars}字。\n\n" f"评论：{prompt_text}"),
                 system_prompt=system_prompt,
             )
-            text = (llm_resp.completion_text or "").strip()
-            if len(text) > max_chars:
-                text = text[:max_chars]
-            yield event.plain_result(f"Dry Run 回复：\n{reply_prefix}{text}")
+            text = self._finalize_reply_text(
+                llm_resp.completion_text or "",
+                max_chars=max_chars,
+                reply_prefix=reply_prefix,
+            )
+            yield event.plain_result(f"Dry Run 回复：\n{text}")
         except Exception as e:  # noqa: BLE001
             logger.exception("LLM dry run 失败")
             yield event.plain_result(f"LLM dry run 失败：{e}")

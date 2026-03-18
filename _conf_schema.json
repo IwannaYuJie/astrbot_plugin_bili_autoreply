@@ -97,6 +97,12 @@
     "default": true,
     "hint": "第一次联调建议保持 true，确认回复文本和命中范围正确后再关闭"
   },
+  "dry_run_mark_processed": {
+    "type": "bool",
+    "description": "演练模式下是否也将消息标记为已处理",
+    "default": false,
+    "hint": "默认关闭以保持兼容；开启后可避免 auto_poll + dry_run 反复处理同一批消息"
+  },
   "persona_prompt": {
     "type": "text",
     "description": "回复人格提示词",
