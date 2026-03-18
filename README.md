@@ -89,7 +89,8 @@
 
 下生成：
 
-- `processed_comments.json`：已处理评论 ID
+- `processed_comments.json`：已处理评论 ID（仅保留最近 5000 条）
+- `processed_messages.json`：已处理消息触发 ID（仅保留最近 5000 条）
 - `reply_history.jsonl`：回复历史
 - `state.json`：运行状态文件
 

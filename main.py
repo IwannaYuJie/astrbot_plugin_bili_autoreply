@@ -311,7 +311,9 @@ class BilibiliReplyPlugin(Star):
         self.history_file = self.plugin_data_dir / "reply_history.jsonl"
         self.plugin_data_dir.mkdir(parents=True, exist_ok=True)
         self.processed_comments: set[str] = set()
+        self.processed_comment_order: list[str] = []
         self.processed_messages: set[str] = set()
+        self.processed_message_order: list[str] = []
         self.message_baseline: dict[str, Any] = {}
         self._auto_task: asyncio.Task | None = None
         self._cycle_lock = asyncio.Lock()
@@ -359,23 +361,57 @@ class BilibiliReplyPlugin(Star):
         if not self.history_file.exists():
             self.history_file.write_text("", encoding="utf-8")
 
+    def _processed_retention_limit(self) -> int:
+        return 5000
+
+    def _trim_processed_orders(self):
+        limit = self._processed_retention_limit()
+        if len(self.processed_comment_order) > limit:
+            self.processed_comment_order = self.processed_comment_order[-limit:]
+        if len(self.processed_message_order) > limit:
+            self.processed_message_order = self.processed_message_order[-limit:]
+        self.processed_comments = set(self.processed_comment_order)
+        self.processed_messages = set(self.processed_message_order)
+
+    def _mark_processed_comment(self, comment_id: str):
+        cid = str(comment_id)
+        if not cid:
+            return
+        if cid in self.processed_comments:
+            self.processed_comment_order = [x for x in self.processed_comment_order if x != cid]
+        self.processed_comment_order.append(cid)
+        self._trim_processed_orders()
+
+    def _mark_processed_message(self, msg_id: str):
+        mid = str(msg_id)
+        if not mid:
+            return
+        if mid in self.processed_messages:
+            self.processed_message_order = [x for x in self.processed_message_order if x != mid]
+        self.processed_message_order.append(mid)
+        self._trim_processed_orders()
+
     def _load_processed_comments(self):
         try:
             if self.processed_file.exists():
                 data = json.loads(self.processed_file.read_text(encoding="utf-8"))
                 if isinstance(data, list):
-                    self.processed_comments = {str(x) for x in data}
+                    self.processed_comment_order = [str(x) for x in data]
+                    self.processed_comments = set(self.processed_comment_order)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"加载 processed_comments 失败: {e}")
             self.processed_comments = set()
+            self.processed_comment_order = []
         try:
             if self.processed_msg_file.exists():
                 data = json.loads(self.processed_msg_file.read_text(encoding="utf-8"))
                 if isinstance(data, list):
-                    self.processed_messages = {str(x) for x in data}
+                    self.processed_message_order = [str(x) for x in data]
+                    self.processed_messages = set(self.processed_message_order)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"加载 processed_messages 失败: {e}")
             self.processed_messages = set()
+            self.processed_message_order = []
         try:
             if self.message_baseline_file.exists():
                 data = json.loads(self.message_baseline_file.read_text(encoding="utf-8"))
@@ -384,18 +420,19 @@ class BilibiliReplyPlugin(Star):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"加载 message_baseline 失败: {e}")
             self.message_baseline = {}
+        self._trim_processed_orders()
 
     def _save_processed_comments(self):
         try:
             self.processed_file.write_text(
-                json.dumps(sorted(self.processed_comments), ensure_ascii=False, indent=2),
+                json.dumps(self.processed_comment_order, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"保存 processed_comments 失败: {e}")
         try:
             self.processed_msg_file.write_text(
-                json.dumps(sorted(self.processed_messages), ensure_ascii=False, indent=2),
+                json.dumps(self.processed_message_order, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except Exception as e:  # noqa: BLE001
@@ -793,9 +830,9 @@ class BilibiliReplyPlugin(Star):
                 history["api_result"] = result
                 if result.get("code") == 0:
                     history["status"] = "replied"
-                    self.processed_messages.add(trigger.msg_id)
+                    self._mark_processed_message(trigger.msg_id)
                     if trigger.parent_id:
-                        self.processed_comments.add(trigger.parent_id)
+                        self._mark_processed_comment(trigger.parent_id)
                     self._save_processed_comments()
                 else:
                     history["status"] = "failed"
